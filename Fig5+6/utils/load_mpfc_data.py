@@ -1,22 +1,51 @@
 import os
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
-os.chdir("/home/xulu/code/alison_spyglass")
-from alison_behav import *
 import datajoint as dj
 from spyglass.utils.dj_helper_fn import fetch_nwb
 from spyglass.common import AnalysisNwbfile
-behavior_model_table = dj.FreeTable(
-    dj.conn(), "`alison_rlmodel`.`__behavior_model_results__by_day`"
-)
 from spyglass.common import Nwbfile
 from pynwb import NWBHDF5IO
 from spyglass.utils.nwb_helper_fn import get_nwb_file
-from spyglass.utils.dj_helper_fn import _get_nwb_object
-from spyglass.common import DIOEvents, Nwbfile, interval_list_intersect
-import numpy as np
+from spyglass.common import DIOEvents, Nwbfile
+from pathlib import Path
 
+from c3po.utils.dandi import get_dandi_file
+from c3po.analysis.intervals import interval_list_intersect
+
+
+# Helpers
+def _get_nwb_object(objects, object_id):
+    """Retrieve NWB object and try to convert to dataframe if possible"""
+    try:
+        return objects[object_id].to_dataframe()
+    except AttributeError:
+        return objects[object_id]
+
+
+from spyglass.utils.dj_mixin import SpyglassMixin
+
+
+class AnalysisFreeTable(SpyglassMixin, dj.FreeTable):
+    """Access existing analysis tables using Spyglass NWB fetching.
+
+    Provides Spyglass's native fetch_nwb implementation for dynamically
+    referenced DataJoint tables.
+
+    The analysis NWB table is specified explicitly because dynamically
+    constructed tables may not expose the foreign-key information needed
+    for automatic resolution.
+    """
+
+    _nwb_table = AnalysisNwbfile
+    definition = "placeholder"
+
+
+behavior_model_table = AnalysisFreeTable(
+    dj.conn(), "`alison_rlmodel`.`__behavior_model_results__by_day`"
+)
 
 subject = "wilbur"
 date = "20210404"
@@ -24,10 +53,11 @@ file_name = subject + date
 behavior_model_params_name = "default_hmm"
 behavior_model_params_name = "default_betalik_addleaf"
 
+
 def fetch_behavioral_data(
     nwb_file_name,
-    behavior_model_params_name= "default_betalik_addleaf",
-    trials_info_by_rat_params_name = "decay_default"
+    behavior_model_params_name="default_betalik_addleaf",
+    trials_info_by_rat_params_name="decay_default",
 ):
     file_name = nwb_file_name.split("_.nwb")[0]
     subject = file_name[:-8]
@@ -39,27 +69,13 @@ def fetch_behavioral_data(
         # "trials_info_by_rat_params_name": trials_info_by_rat_params_name,
     }
     # all_behav = behav_results.fetch1_dataframe()
-    all_behav = fetch_nwb(behav_results, (AnalysisNwbfile, "analysis_file_abs_path"))[0][
-        "behavior_model_results_by_day"
-    ]
+    # all_behav = fetch_nwb(behav_results, (AnalysisNwbfile, "analysis_file_abs_path"))[0][
+    #     "behavior_model_results_by_day"
+    # ]
+    all_behav = behav_results.fetch_nwb()[0]["behavior_model_results_by_day"]
     all_behav
 
-
-    script_table = StateScriptTrials() & {"nwb_file_name": nwb_file_name}
-    trials = []
-    epoch = []
-    t_poke = []
-    t_out = []
-    for epoch_i in script_table.fetch("epoch"):
-        table = script_table & {"epoch": epoch_i}
-        trials.extend(table.fetch1("trial"))
-        epoch.extend([epoch_i] * len(table.fetch1("trial")))
-        t_poke.extend(table.fetch1("poke_in_ts"))
-        t_out.extend(table.fetch1("poke_out_ts"))
-    script_df = pd.DataFrame(
-        {"epoch": epoch, "trial_number_by_epoch": trials, "t_poke": t_poke, "t_out": t_out},
-    )
-    script_df
+    script_df = fetch_state_script_df(nwb_file_name)
 
     ## Calculate turn direction of each trial and add to table
     trial_df = pd.merge(all_behav, script_df, on=["epoch", "trial_number_by_epoch"])
@@ -90,7 +106,9 @@ def fetch_behavioral_data(
         epoch_df = trial_df[trial_df["epoch"] == epoch]
         turns.append("start")
         for i in range(1, len(epoch_df)):
-            turn = turn_lookup[(epoch_df["leaf"].values[i - 1], epoch_df["leaf"].values[i])]
+            turn = turn_lookup[
+                (epoch_df["leaf"].values[i - 1], epoch_df["leaf"].values[i])
+            ]
             turns.append(turn)
     if "turns" not in trial_df.columns:
         trial_df["turns"] = turns
@@ -111,7 +129,6 @@ def fetch_behavioral_data(
         run_starts.extend(epoch_df["t_out"].values[:-1].tolist())
     if "run_start" not in trial_df.columns:
         trial_df["run_start"] = run_starts
-
 
     # load alison data
     alison_df = fetch_alison_df(nwb_file_name)
@@ -204,7 +221,9 @@ def fetch_behavioral_data(
         # --- Q_leaf_C (Next trial's leaf, current trial's Q-value) ---
         if i + 1 < n:
             next_leaf = int(leaf[i + 1])
-            Q_leaf_C.append(Q_array_current[next_leaf - 1])  # Peek at next leaf, pull from current Q-array
+            Q_leaf_C.append(
+                Q_array_current[next_leaf - 1]
+            )  # Peek at next leaf, pull from current Q-array
         else:
             Q_leaf_C.append(np.nan)  # Last trial has no "next trial"
 
@@ -288,7 +307,9 @@ def fetch_behavioral_data(
 
     trial_df["Leaf_A_reward"] = trial_df["reward"].shift(1)
     trial_df["Q_leaf_A_update"] = trial_df["Q_leaf_A"] - trial_df["Q_leaf_A_prev"]
-    trial_df["Qdep_leaf_A_update"] = trial_df["Qdep_leaf_A"] - trial_df["Qdep_leaf_A_prev"]
+    trial_df["Qdep_leaf_A_update"] = (
+        trial_df["Qdep_leaf_A"] - trial_df["Qdep_leaf_A_prev"]
+    )
 
     # =========================
     # STEP 6: Previous Poke Time
@@ -315,7 +336,6 @@ def fetch_behavioral_data(
     leaf = trial_df["leaf"].values
     reward = trial_df["reward"].values
     n = len(trial_df)
-
 
     # =========================
     # STEP 9.1: LEAF B (current leaf)
@@ -364,7 +384,9 @@ def fetch_behavioral_data(
     trial_df["Qdep_leaf_B_next"] = Qdep_leaf_B_next
 
     trial_df["Qdep_leaf_B_prev_update"] = Qdep_leaf_B_prev_update
-    trial_df["Qdep_leaf_B_new_update"] = trial_df["Qdep_leaf_B_next"] - trial_df["Qdep_leaf_B"]
+    trial_df["Qdep_leaf_B_new_update"] = (
+        trial_df["Qdep_leaf_B_next"] - trial_df["Qdep_leaf_B"]
+    )
 
     # =========================
     # STEP 9.2: LEAF A (previous leaf)
@@ -393,23 +415,18 @@ def fetch_behavioral_data(
     trial_df["Qdep_leaf_A_prev"] = Qdep_leaf_A_prev
     trial_df["Qdep_leaf_A"] = Qdep_leaf_A
 
-    trial_df["Qdep_leaf_A_update"] = trial_df["Qdep_leaf_A"] - trial_df["Qdep_leaf_A_prev"]
+    trial_df["Qdep_leaf_A_update"] = (
+        trial_df["Qdep_leaf_A"] - trial_df["Qdep_leaf_A_prev"]
+    )
 
-
-    return {"trial_df": trial_df,
-            "alison_df": alison_df}
-
+    return {"trial_df": trial_df, "alison_df": alison_df}
 
 
 def fetch_dio_times(nwb_file_name):
     # Fetch the NWB file and DIO pump times
     key = {"nwb_file_name": nwb_file_name}
     nwb = (Nwbfile() & key).fetch_nwb()[0]
-    dio_query = (
-        DIOEvents()
-        & key
-        & "dio_event_name LIKE 'pump%'"
-    )
+    dio_query = DIOEvents() & key & "dio_event_name LIKE 'pump%'"
 
     pump_obj_ids = dio_query.fetch("dio_object_id")
     all_pump_intervals = []
@@ -424,13 +441,9 @@ def fetch_dio_times(nwb_file_name):
         all_pump_intervals.extend(pump_intervals)
     all_pump_intervals = np.array(all_pump_intervals)
     ind = np.argsort(all_pump_intervals[:, 0])
-    all_pump_intervals = all_pump_intervals[ind] # return this
+    all_pump_intervals = all_pump_intervals[ind]  # return this
 
-    dio_query = (
-        DIOEvents()
-        & key
-        & "dio_event_name LIKE 'poke%'"
-    )
+    dio_query = DIOEvents() & key & "dio_event_name LIKE 'poke%'"
     poke_obj_ids = dio_query.fetch("dio_object_id")
     all_poke_intervals = []
     for obj_id in poke_obj_ids:
@@ -444,36 +457,94 @@ def fetch_dio_times(nwb_file_name):
         all_poke_intervals.extend(poke_intervals)
     all_poke_intervals = np.array(all_poke_intervals)
     ind = np.argsort(all_poke_intervals[:, 0])
-    all_poke_intervals = all_poke_intervals[ind] # return this
+    all_poke_intervals = all_poke_intervals[ind]  # return this
     return {
         "all_pump_intervals": all_pump_intervals,
-        "all_poke_intervals": all_poke_intervals
+        "all_poke_intervals": all_poke_intervals,
     }
+
 
 def fetch_decoding_df(nwb_file_name):
     key = {"nwb_file_name": nwb_file_name}
     schema = dj.schema("alison_decoding")
     table_name = "`alison_decoding`.`__clusterless_acausal_results_summary`"
-    acausal_results_table = dj.FreeTable(dj.conn(), table_name)
-
+    acausal_results_table = AnalysisFreeTable(dj.conn(), table_name)
+    if not dj.FreeTable(dj.conn(), table_name).is_declared and (
+        nwb_file_name.lower() == "wilbur20210406_.nwb"
+    ):
+        return fetch_decoding_df_dandi_direct()
     acausal_results_keys = (acausal_results_table & key).fetch("KEY")
     acausal_results = acausal_results_table & acausal_results_keys
-    nwb_list = fetch_nwb(acausal_results, (AnalysisNwbfile, "analysis_file_abs_path"))
+    nwb_list = acausal_results.fetch_nwb()
     decoding_df = pd.concat([nwb["results_df"] for nwb in nwb_list], ignore_index=True)
     decoding_df.set_index("time", inplace=True)
     return decoding_df
 
+
+def fetch_decoding_df_dandi_direct():
+    cache_dir = Path(
+        os.environ.get("C3PO_CACHE_DIR", os.path.expanduser("~/.c3po_cache"))
+    )
+    file_path = cache_dir / "clusterless_acausal_results.pckl"
+    if file_path.exists():
+        return pd.read_pickle(file_path)
+    # load dataframe and save to local cache (because it's big and slow
+    dandi_decode_sources = [
+        {
+            "dandiset_id": "001942",
+            "dandi_path": "sub-wilbur/sub-wilbur_ses-wilbur-20210406_obj-1exuv2g.nwb",
+            "dandi_instance": "dandi",
+        },
+        {
+            "dandiset_id": "001942",
+            "dandi_path": "sub-wilbur/sub-wilbur_ses-wilbur-20210406_obj-rjyj4k.nwb",
+            "dandi_instance": "dandi",
+        },
+        {
+            "dandiset_id": "001942",
+            "dandi_path": "sub-wilbur/sub-wilbur_ses-wilbur-20210406_obj-1jmkj6n.nwb",
+            "dandi_instance": "dandi",
+        },
+        {
+            "dandiset_id": "001942",
+            "dandi_path": "sub-wilbur/sub-wilbur_ses-wilbur-20210406_obj-dj757b.nwb",
+            "dandi_instance": "dandi",
+        },
+        {
+            "dandiset_id": "001942",
+            "dandi_path": "sub-wilbur/sub-wilbur_ses-wilbur-20210406_obj-h5iyha.nwb",
+            "dandi_instance": "dandi",
+        },
+    ]
+
+    decoding_df = []
+    for dandi_source in tqdm(
+        dandi_decode_sources, desc="Downloading alison's decoding data from DANDI"
+    ):
+        io, nwb = get_dandi_file(**dandi_source)
+        decoding_df.append(nwb.scratch["pandas_table"].to_dataframe())
+    decoding_df = pd.concat(decoding_df, ignore_index=True)
+    decoding_df.set_index("time", inplace=True)
+    decoding_df.to_pickle(file_path)
+    return decoding_df
+
+
 def fetch_alison_df(nwb_file_name):
+    from .util_tables import BehavTable
+
+    behav_table = BehavTable() & {"nwb_file_name": nwb_file_name}
+    if behav_table:
+        return behav_table.fetch_nwb()[0]["behav"]
+
     file_name = nwb_file_name.split("_.nwb")[0]
     subject_id = file_name[:-8]
     date = file_name[-8:]
-
     # quick loading extracted df
     out_path = f"/stelmo/sam/c3po_datasets/{subject_id}{date}_big_df.pkl"
     if os.path.exists(out_path):
         return pd.read_pickle(out_path)
 
-    #slow loading from the big df
+    # slow loading from the big df
     out_path = "/stelmo/alison/big_df_pkls/"
     today_now = "20230113"
     wilbur_big_df = pd.read_pickle(
@@ -482,3 +553,33 @@ def fetch_alison_df(nwb_file_name):
     return wilbur_big_df[wilbur_big_df["nwb_file_name"] == nwb_file_name]
 
 
+def fetch_state_script_df(nwb_file_name):
+    from .util_tables import CompiledStateScriptDataframe
+
+    script_table = CompiledStateScriptDataframe() & {"nwb_file_name": nwb_file_name}
+    if script_table:
+        return script_table.fetch_nwb()[0]["script"]
+
+    StateScriptTrials_table = dj.FreeTable(
+        dj.conn(), "`alison_behav`.`__state_script_trials`"
+    )
+    script_table = StateScriptTrials_table & {"nwb_file_name": nwb_file_name}
+    trials = []
+    epoch = []
+    t_poke = []
+    t_out = []
+    for epoch_i in script_table.fetch("epoch"):
+        table = script_table & {"epoch": epoch_i}
+        trials.extend(table.fetch1("trial"))
+        epoch.extend([epoch_i] * len(table.fetch1("trial")))
+        t_poke.extend(table.fetch1("poke_in_ts"))
+        t_out.extend(table.fetch1("poke_out_ts"))
+    script_df = pd.DataFrame(
+        {
+            "epoch": epoch,
+            "trial_number_by_epoch": trials,
+            "t_poke": t_poke,
+            "t_out": t_out,
+        },
+    )
+    return script_df
